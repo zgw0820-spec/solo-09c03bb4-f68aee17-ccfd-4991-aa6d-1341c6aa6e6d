@@ -21,12 +21,19 @@ def li_vn_mode(li: int, version: int, mode: int) -> int:
 
 
 def unix_to_ntp(ts: float) -> bytes:
-    """unix 秒 -> 8 字节 NTP 时间戳（32.32 定点）。"""
+    """unix 秒 -> 8 字节 NTP 时间戳（32.32 定点）。
+
+    取整而不是截断，使微秒级时刻的往返误差不超过半个 1/2^32 秒；
+    截断会让“同一时刻”的两次换算偏差达到 232ps，在 T3−T2 很小时被放大。
+    """
     if ts is None or ts <= 0:
         return b"\x00" * 8
     ntp = ts + NTP_EPOCH_OFFSET
     sec = int(ntp)
-    frac = int((ntp - sec) * (1 << 32)) & 0xFFFFFFFF
+    frac = int(round((ntp - sec) * (1 << 32)))
+    if frac >= (1 << 32):   # 舍入进位
+        sec += 1
+        frac -= 1 << 32
     return struct.pack("!II", sec, frac)
 
 

@@ -14,6 +14,7 @@ from common import ntp
 
 UPSTREAM_API = os.getenv("UPSTREAM_API", "http://127.0.0.1:8001")
 RELAY_UDP_PORT = int(os.getenv("RELAY_UDP_PORT", "10123"))
+QUEUE_MAX_AGE = float(os.getenv("RELAY_QUEUE_MAX_AGE", "1.0"))
 
 PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -47,6 +48,7 @@ PAGE = """<!doctype html>
   <div class="row"><span class="k">走时速度</span><span id="rate">--</span></div>
   <div class="row"><span class="k">距最后一次有效上游答复</span><span id="age">--</span></div>
   <div class="row"><span class="k">报文统计</span><span id="stats">--</span></div>
+  <div class="row"><span class="k">最近一次下游排队耗时 T3−T2</span><span id="lastq">--</span></div>
 </section>
 
 <section>
@@ -67,6 +69,7 @@ PAGE = """<!doctype html>
     <button id="qbtn">发 UDP 试查</button>
     <label><input id="autoq" type="checkbox"> 每秒自动试查</label>
   </div>
+  <div class="row"><span class="k">排队是否计入中继耗时</span><span id="kts">--</span></div>
   <pre id="qresult">尚未试查</pre>
 </section>
 
@@ -100,7 +103,9 @@ async function refresh(){
     $('rate').textContent = (s.rate*100).toFixed(0) + ' %';
     $('age').textContent = s.last_valid_age === null ? '从未收到' : s.last_valid_age.toFixed(1) + ' 秒';
     const st = s.stats;
-    $('stats').textContent = `发出 ${st.sent} / 有效 ${st.valid} / 超时丢弃 ${st.late} / 未知 ${st.unknown} / 下游查询 ${s.downstream_queries}`;
+    $('stats').textContent = `发出 ${st.sent} / 有效 ${st.valid} / 超时丢弃 ${st.late} / 未知 ${st.unknown} / 下游查询 ${st.downstream_queries} / 队列过期丢弃 ${st.dropped_stale}`;
+    $('lastq').textContent = st.last_queue_ms === null ? '--'
+      : `${st.last_queue_ms.toFixed(2)} ms（最大 ${st.max_queue_ms.toFixed(2)} ms）`;
     const u = s.upstream || {};
     if (u.error) { $('upcfg').textContent = '控制不可达: ' + u.error; $('uptime').textContent = '--'; }
     else {
@@ -123,11 +128,17 @@ $('apply').onclick = async () => {
 async function doQuery(){
   const r = await api('/api/query', 'POST', {});
   if (!r.ok) { $('qresult').textContent = '试查失败: ' + (r.error || ''); return; }
+  $('kts').textContent = r.kernel_timestamp ? '是（内核收包时刻）'
+                                            : '否（仅用户态读取时刻）';
   $('qresult').textContent =
     `授时时刻 T3 : ${r.server_time_str}\\n` +
+    `入队时刻 T2 : ${r.enqueue_time_str}\\n` +
+    `排队+处理 T3−T2 : ${r.queue_ms} ms\\n` +
+    `实测往返 RTT : ${r.rtt_ms} ms\\n` +
+    `扣除排队后往返 : ${r.adjusted_rtt_ms} ms\\n` +
     `同步状态    : ${r.synchronized ? '同步 (LI=0)' : '未同步 (LI=3)'}\\n` +
     `层级 stratum: ${r.stratum}\\n` +
-    `往返时延    : ${r.rtt_ms} ms`;
+    `客户端钟差估算: ${r.offset_est_ms} ms（NTP 四点法）`;
 }
 $('qbtn').onclick = doQuery;
 let timer = null;
@@ -150,8 +161,14 @@ def fmt_ts(ts):
     return dt.strftime("%Y-%m-%d %H:%M:%S") + f".{ms % 1000:03d}"
 
 
-async def ntp_query(port: int, timeout: float = 2.0) -> dict:
-    """网页后端作为下游客户端，经 UDP 向中继发一次 NTP 查询。"""
+async def ntp_query(port: int, timeout: float = 2.0,
+                    kernel_timestamp: bool = False) -> dict:
+    """网页后端作为下游客户端，经 UDP 向中继发一次 NTP 查询。
+
+    中继把“请求入队时刻 T2”写在 receive 字段、“即将发包时刻 T3”写在
+    transmit 字段，因此 T3−T2 可直接从报文读出；扣除它即得排队影响被
+    去除后的往返时延估计。
+    """
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
@@ -163,14 +180,27 @@ async def ntp_query(port: int, timeout: float = 2.0) -> dict:
         t4 = time.time()
         msg = ntp.parse(data)
         synced = msg["li"] != ntp.LI_ALARM
+        rtt = t4 - t1
+        queue_raw = msg["xmit"] - msg["recv"]
+        # 32 位小数截断可能给出微小的负值，按 0 处理；不封顶，
+        # 因为排队耗时超过往返只可能是时戳抖动，展示原值便于排查
+        queue = max(0.0, queue_raw)
+        offset = ((msg["recv"] - t1) + (msg["xmit"] - t4)) / 2.0
         return {
             "ok": True,
             "server_time": msg["xmit"],
             "server_time_str": fmt_ts(msg["xmit"]),
+            "enqueue_time": msg["recv"] or None,
+            "enqueue_time_str": fmt_ts(msg["recv"] or None),
+            "queue_ms": round(queue * 1000, 3),
+            "queue_inband_ms": round(queue_raw * 1000, 3),
+            "rtt_ms": round(rtt * 1000, 3),
+            "adjusted_rtt_ms": round(max(0.0, rtt - queue) * 1000, 3),
+            "offset_est_ms": round(offset * 1000, 3),
             "li": msg["li"],
             "synchronized": synced,
             "stratum": msg["stratum"],
-            "rtt_ms": round((t4 - t1) * 1000, 2),
+            "kernel_timestamp": kernel_timestamp,
         }
     except asyncio.TimeoutError:
         return {"ok": False, "error": "查询超时"}
@@ -184,7 +214,7 @@ class UpstreamConfig(BaseModel):
     disconnected: bool | None = None
 
 
-def create_app(clock, stats, server) -> FastAPI:
+def create_app(clock, stats, server, udp_server=None) -> FastAPI:
     app = FastAPI(title="NTP 中继值班台")
 
     @app.get("/", response_class=HTMLResponse)
@@ -196,7 +226,10 @@ def create_app(clock, stats, server) -> FastAPI:
         st = clock.status()
         st["time_str"] = fmt_ts(st["time"])
         st["stats"] = vars(stats)
-        st["downstream_queries"] = server.queries
+        st["downstream_queries"] = stats.downstream_queries
+        st["last_downstream"] = server.last_result
+        st["kernel_timestamp"] = bool(udp_server and udp_server.kernel_ts)
+        st["queue_drop_after"] = QUEUE_MAX_AGE
         try:
             async with httpx.AsyncClient(timeout=1.5) as c:
                 r = await c.get(f"{UPSTREAM_API}/api/config")
@@ -214,6 +247,7 @@ def create_app(clock, stats, server) -> FastAPI:
 
     @app.post("/api/query")
     async def query():
-        return await ntp_query(RELAY_UDP_PORT)
+        return await ntp_query(RELAY_UDP_PORT,
+                               kernel_timestamp=bool(udp_server and udp_server.kernel_ts))
 
     return app

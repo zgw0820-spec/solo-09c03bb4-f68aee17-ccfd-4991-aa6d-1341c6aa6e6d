@@ -3,16 +3,35 @@
   1) 断连超期：断开上游 >5s 后回包标未同步，断网期间继续走时不倒退
   2) 上游回拨：中继时钟不倒退、无跳变，以 90% 速度缓调追时
   3) 超时答复：回包延迟超过中继超时后，答复被丢弃，不延长 5 秒窗口
+  4) 下游排队：冻结中继进程模拟内核排队，验证 T3−T2 如实反映排队耗时、
+     值班网页给出扣除排队后的往返估计、入队超过 1 秒的请求被丢弃
+  5) 跨缓调切速：上游回拨触发 90% 缓调，期间入队的请求 T2 仍按入队时
+     的 90% 走时计算（而不是被发包时的速率污染）
+
 运行：BASE=http://127.0.0.1:8000 python3 tests/selftest.py
+排队/切速用例需要向中继进程发 SIGSTOP/SIGCONT，只在 Linux 同机运行时启用：
+RELAY_PID=<中继进程号>。未设置时这些用例会标记为 SKIP。
 """
+import importlib.util
 import json
 import os
+import signal
+import socket
 import sys
 import time
 import urllib.request
 
 BASE = os.environ.get("BASE", "http://127.0.0.1:8000")
+RELAY_PID = os.environ.get("RELAY_PID")
+RELAY_PID = int(RELAY_PID) if RELAY_PID else None
+RELAY_UDP_PORT = int(os.environ.get("RELAY_UDP_PORT", "10123"))
 RESULTS = []
+
+_spec = importlib.util.spec_from_file_location(
+    "ntp_mod", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "common", "ntp.py"))
+ntp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ntp)
 
 
 def api(path, payload=None):
@@ -23,9 +42,10 @@ def api(path, payload=None):
         return json.load(r)
 
 
-def check(name, ok, detail=""):
+def check(name, ok, detail="", skip=False):
     RESULTS.append((name, bool(ok)))
-    print(f"[{'PASS' if ok else 'FAIL'}] {name}  {detail}")
+    tag = "SKIP" if skip else ("PASS" if ok else "FAIL")
+    print(f"[{tag}] {name}  {detail}")
 
 
 def status():
@@ -50,6 +70,111 @@ def wait_synced(want=True, timeout=25.0):
             pass
         time.sleep(0.4)
     return False
+
+
+def udp_query_while_paused(hold: float):
+    """在中继被 SIGSTOP 期间发请求，让报文在内核队列里排队 hold 秒。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(6)
+    os.kill(RELAY_PID, signal.SIGSTOP)
+    try:
+        time.sleep(0.05)
+        t1 = time.time()
+        s.sendto(ntp.build_request(t1), ("127.0.0.1", RELAY_UDP_PORT))
+        time.sleep(hold)
+        t3_expected = time.time()
+        os.kill(RELAY_PID, signal.SIGCONT)
+        try:
+            data, _ = s.recvfrom(512)
+        except socket.timeout:
+            return None
+        t4 = time.time()
+    finally:
+        try:
+            os.kill(RELAY_PID, signal.SIGCONT)
+        except OSError:
+            pass
+        s.close()
+    msg = ntp.parse(data)
+    return {"msg": msg, "t1": t1, "t3_expected": t3_expected, "t4": t4}
+
+
+def test_queue():
+    print("== 4. 内核排队计入中继耗时 ==")
+    if not RELAY_PID:
+        check("排队用例（需 RELAY_PID）", True, "未设置 RELAY_PID", skip=True)
+        return
+    before = status()["stats"]
+    hold = 0.4
+    r = udp_query_while_paused(hold)
+    check("排队期间仍正常应答", r is not None)
+    if r is None:
+        return
+    q = (r["msg"]["xmit"] - r["msg"]["recv"]) * 1000
+    rtt = (r["t4"] - r["t1"]) * 1000
+    check("T3−T2 反映排队耗时", abs(q - hold * 1000) < 60,
+          f"T3−T2={q:.1f}ms，实际冻结 {hold*1000:.0f}ms")
+    check("T2 早于发包时刻", r["msg"]["recv"] < r["msg"]["xmit"])
+    check("排队时同步标记照常", r["msg"]["li"] == 0 and r["msg"]["stratum"] == 2,
+          f"li={r['msg']['li']} stratum={r['msg']['stratum']}")
+    check("T3 早于客户端收到时刻", r["msg"]["xmit"] <= r["t4"] + 0.01)
+
+    wq = query()
+    check("网页试查给出 T3−T2", wq.get("queue_ms") is not None,
+          f"queue_ms={wq.get('queue_ms')}")
+    check("网页给出扣除排队后的往返估计",
+          wq.get("adjusted_rtt_ms") is not None
+          and wq["adjusted_rtt_ms"] <= wq["rtt_ms"],
+          f"rtt={wq['rtt_ms']}ms adjusted={wq['adjusted_rtt_ms']}ms")
+
+    # 冻结 1.2s > 1s 阈值：应答不得返回，且计入 dropped_stale
+    r2 = udp_query_while_paused(1.2)
+    after = status()["stats"]
+    check("入队超过 1 秒的请求被丢弃", r2 is None)
+    check("过期丢弃计入统计", after["dropped_stale"] > before["dropped_stale"],
+          f"dropped_stale {before['dropped_stale']} -> {after['dropped_stale']}")
+
+
+def test_slew_enqueue():
+    print("== 5. 跨缓调切速时 T2 按入队走时计算 ==")
+    if not RELAY_PID:
+        check("跨切速用例（需 RELAY_PID）", True, "未设置 RELAY_PID", skip=True)
+        return
+    set_upstream(offset_seconds=0, delay_ms=0, disconnected=False)
+    wait_synced(True)
+    # 迅速回拨 40s：下一次有效答复后进入 90% 缓调（约 400s 才能追平）
+    set_upstream(offset_seconds=-40)
+    t0 = time.time()
+    while status()["rate"] != 0.9:
+        if time.time() - t0 > 6:
+            check("进入 90% 缓调", False, "超时未进入缓调")
+            break
+        time.sleep(0.1)
+    else:
+        check("进入 90% 缓调", True)
+
+    # 在缓调进行中暂停进程：请求先入队（当时速率 0.9），
+    # 恢复后立即发包（此时中继已被再次校准，发包时速率可能仍是 0.9，
+    # 但关键是 T3−T2 必须按入队后的真实经过时间累计，与实测 RTT 接近）
+    hold = 0.5
+    r = udp_query_while_paused(hold)
+    check("缓调期间排队仍正常应答", r is not None)
+    if r is not None:
+        q = (r["msg"]["xmit"] - r["msg"]["recv"]) * 1000
+        rtt = (r["t4"] - r["t1"]) * 1000
+        # 中继按 0.9 走时，排队 0.5s 的中继时间应约为 450ms
+        check("T2/T3 使用同一走时轴（≈0.9×排队）",
+              abs(q - hold * 900) < 80,
+              f"T3−T2={q:.1f}ms，预期≈{hold*900:.0f}ms")
+        check("排队耗时不超过客户端实测往返", q <= rtt + 5,
+              f"T3−T2={q:.1f}ms rtt={rtt:.1f}ms")
+
+    print("   （对照）缓调中冻结 1.2s 仍应丢弃：")
+    r2 = udp_query_while_paused(1.2)
+    check("切速期间超龄请求照常丢弃", r2 is None)
+
+    set_upstream(offset_seconds=0, delay_ms=0, disconnected=False)
+    check("复位后恢复同步", wait_synced(True))
 
 
 def main():
@@ -114,6 +239,9 @@ def main():
           q["ok"] and isinstance(q["server_time_str"], str)
           and "." in q["server_time_str"],
           q.get("server_time_str", ""))
+
+    test_queue()
+    test_slew_enqueue()
 
     failed = sum(1 for _, ok in RESULTS if not ok)
     print(f"\n==== 自测完成: {len(RESULTS) - failed}/{len(RESULTS)} 通过 ====")

@@ -9,6 +9,7 @@ services:
       UPSTREAM_UDP_PORT: "123"
       UPSTREAM_API_PORT: "8001"
     networks: [timesync]
+    restart: unless-stopped
 
   relay:
     build:
@@ -24,12 +25,17 @@ services:
       WEB_PORT: "8000"
       RELAY_POLL_INTERVAL: "1.0"
       RELAY_REPLY_TIMEOUT: "1.5"
+      RELAY_QUEUE_MAX_AGE: "1.0"      # 入队超过 1 秒的请求丢弃
+      RELAY_UDP_RCVBUF: "1048576"     # 集中查时的内核接收缓冲
+    # 宿主机 / 容器系统时钟需连续走时（不得阶跃），内核收包时刻才能
+    # 稳定换算到中继单调时钟轴
     ports:
       - "8000:8000"        # 值班网页
       - "8123:123/udp"     # 宿主机向中继试查
     depends_on:
       - upstream
     networks: [timesync]
+    restart: unless-stopped
 
 networks:
   timesync:
