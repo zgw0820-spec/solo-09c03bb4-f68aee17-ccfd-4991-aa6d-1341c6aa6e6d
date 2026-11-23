@@ -1,0 +1,35 @@
+services:
+  upstream:
+    build:
+      context: .
+      dockerfile: docker/upstream.Dockerfile
+    image: ntp-lab-upstream
+    container_name: ntp-upstream
+    environment:
+      UPSTREAM_UDP_PORT: "123"
+      UPSTREAM_API_PORT: "8001"
+    networks: [timesync]
+
+  relay:
+    build:
+      context: .
+      dockerfile: docker/relay.Dockerfile
+    image: ntp-lab-relay
+    container_name: ntp-relay
+    environment:
+      UPSTREAM_HOST: upstream
+      UPSTREAM_PORT: "123"
+      UPSTREAM_API: http://upstream:8001
+      RELAY_UDP_PORT: "123"
+      WEB_PORT: "8000"
+      RELAY_POLL_INTERVAL: "1.0"
+      RELAY_REPLY_TIMEOUT: "1.5"
+    ports:
+      - "8000:8000"        # 值班网页
+      - "8123:123/udp"     # 宿主机向中继试查
+    depends_on:
+      - upstream
+    networks: [timesync]
+
+networks:
+  timesync:
